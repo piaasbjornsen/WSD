@@ -8,8 +8,11 @@ from collections import defaultdict
 import redis
 import requests
 
+from kafka import KafkaProducer, KafkaConsumer
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+import threading
+import json
 
 
 DB_ERROR_STR = "DB error"
@@ -41,16 +44,23 @@ class OrderValue(Struct):
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
-        # get serialized data
         entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
-        # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
+
+
+# Initialize Kafka producer
+producer = KafkaProducer(bootstrap_servers=['localhost:9092'],
+                         value_serializer=lambda v: json.dumps(v).encode('utf-8'))
+
+
+def emit_event(event_data):
+    producer.send('order_events', value=event_data)
+    producer.flush()
 
 
 @app.post('/create/<user_id>')
@@ -61,6 +71,13 @@ def create_order(user_id: str):
         db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
+
+    emit_event({
+        "event_type": "OrderCreated",
+        "order_id": key,
+        "user_id": user_id
+    })
+
     return jsonify({'order_id': key})
 
 
@@ -79,7 +96,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         value = OrderValue(paid=False,
                            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
                            user_id=f"{user_id}",
-                           total_cost=2*item_price)
+                           total_cost=2 * item_price)
         return value
 
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
@@ -128,7 +145,6 @@ def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = get_order_from_db(order_id)
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
-        # Request failed because item does not exist
         abort(400, f"Item: {item_id} does not exist!")
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
@@ -150,37 +166,150 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
+
+    emit_event({
+        "event_type": "OrderInitiated",
+        "order_id": order_id,
+        "user_id": order_entry.user_id,
+        "total_cost": order_entry.total_cost,
+        "items": list(items_quantities.items())
+    })
+
+    return Response("Checkout initiated", status=200)
+
+#If enough credit is reserved, check if we can reserve enough stock
+def handle_credit_reserved(event_data):
+    user_id = event_data['user_id']
+    total_cost = event_data['total_cost']
+    order_id = event_data['order_id']
+    items = event_data['items']
+
+    emit_event({
+        "event_type": "StockCheck",
+        "order_id": order_id,
+        "user_id": user_id,
+        "total_cost": total_cost,
+        "items": items
+    })
+
+#If there is not enough credit, tell them that checkout cant proceed and fail checkout
+def handle_credit_reservation_failed(event_data):
+    user_id = event_data['user_id']
+    total_cost = event_data['total_cost']
+    order_id = event_data['order_id']
+    items = event_data['items']
+    reason = event_data.get('reason', 'Unknown reason')
+
+    emit_event({
+        "event_type": "CheckoutFailed",
+        "order_id": order_id,
+        "user_id": user_id,
+        "total_cost": total_cost,
+        "items": items,
+        "reason": f"Credit reservation failed: {reason}"
+    })
+
+#If stock is reserved, this means both payment and stock is reserved so checkout can be completed
+def handle_stock_checked(event_data):
+    order_id = event_data['order_id']
+    order_entry: OrderValue = get_order_from_db(order_id)
     order_entry.paid = True
+
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+        emit_event({
+            "event_type": "CheckoutFailed",
+            "order_id": order_id,
+            "reason": "Database error while finalizing checkout"
+        })
+        return
+
+    emit_event({
+        "event_type": "CheckoutCompleted",
+        "order_id": order_id,
+        "user_id": order_entry.user_id,
+        "total_cost": order_entry.total_cost
+    })
+
+#If stock cant be reserve, lead to checkoutfailed
+def handle_stock_reservation_failed(event_data):
+    user_id = event_data['user_id']
+    total_cost = event_data['total_cost']
+    order_id = event_data['order_id']
+    items = event_data['items']
+    reason = event_data.get('reason', 'Unknown reason')
+
+    emit_event({
+        "event_type": "CheckoutFailed",
+        "order_id": order_id,
+        "user_id": user_id,
+        "total_cost": total_cost,
+        "items": items,
+        "reason": f"Stock reservation failed: {reason}"
+    })
+
+
+# def handle_checkout_completed(event_data):
+#     pass
+
+
+#If checkout fails, release credit
+def handle_checkout_failed(event_data):
+    user_id = event_data['user_id']
+    total_cost = event_data['total_cost']
+    order_id = event_data['order_id']
+    items = event_data['items']
+    reason = event_data['reason']
+
+    emit_event({
+        "event_type": "ReleaseCredit",
+        "order_id": order_id,
+        "user_id": user_id,
+        "total_cost": total_cost,
+        "items": items,
+        "reason": reason
+    })
+
+    emit_event({
+        "event_type": "ReleaseStock",
+        "order_id": order_id,
+        "user_id": user_id,
+        "total_cost": total_cost,
+        "items": items,
+        "reason": reason
+    })
+
+
+def consume_events():
+    consumer = KafkaConsumer('payment_events', 'stock_events', 'order_events',
+                             bootstrap_servers=['localhost:9092'],
+                             auto_offset_reset='earliest',
+                             group_id='order_group',
+                             value_deserializer=lambda x: json.loads(x.decode('utf-8')))
+    for event in consumer:
+        event_type = event.value.get('event_type')
+        if event_type == 'CreditReserved':
+            handle_credit_reserved(event.value)
+        elif event_type == 'CreditReservationFailed':
+            handle_credit_reservation_failed(event.value)
+        elif event_type == 'StockChecked':
+            handle_stock_checked(event.value)
+        elif event_type == 'StockReservationFailed':
+            handle_stock_reservation_failed(event.value)
+        # elif event_type == 'CheckoutCompleted':
+        #     handle_checkout_completed(event.value)
+        elif event_type == 'CheckoutFailed':
+            handle_checkout_failed(event.value)
 
 
 if __name__ == '__main__':
+    consumer_thread = threading.Thread(target=consume_events)
+    consumer_thread.start()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+   
