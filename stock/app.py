@@ -2,19 +2,18 @@ import logging
 import os
 import atexit
 import uuid
+import time
 import threading
 
 import redis
-
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-
 
 DB_ERROR_STR = "DB error"
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(
+db = redis.Redis(
     host=os.environ["REDIS_HOST"],
     port=int(os.environ["REDIS_PORT"]),
     password=os.environ["REDIS_PASSWORD"],
@@ -22,6 +21,21 @@ db: redis.Redis = redis.Redis(
 )
 
 pubsub = db.pubsub()
+pubsub.subscribe("stock_events")
+
+
+def publish_event(channel, event):
+    for attempt in range(3):
+        try:
+            db.publish(channel, msgpack.encode(event))
+            app.logger.debug(f"Event published: {event}")
+            return True
+        except redis.exceptions.RedisError as e:
+            app.logger.warning(
+                f"Failed to publish event: {event}, attempt {attempt+1}, error: {str(e)}"
+            )
+    app.logger.error(f"Failed to publish event after retries: {event}")
+    return False
 
 
 def close_db_connection():
@@ -37,15 +51,15 @@ class StockValue(Struct):
 
 
 def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
     try:
-        entry: bytes = db.get(item_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
+        entry = db.get(item_id)
+        app.logger.debug(f"Retrieved item entry from DB: {entry}")
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when retrieving item {item_id}: {str(e)}")
+        abort(400, DB_ERROR_STR)
+    entry = msgpack.decode(entry, type=StockValue) if entry else None
     if entry is None:
-        # if item does not exist in the database; abort
+        app.logger.error(f"Item: {item_id} not found!")
         abort(400, f"Item: {item_id} not found!")
     return entry
 
@@ -53,128 +67,125 @@ def get_item_from_db(item_id: str) -> StockValue | None:
 @app.post("/item/create/<price>")
 def create_item(price: int):
     key = str(uuid.uuid4())
-    app.logger.debug(f"Item: {key} created")
+    app.logger.debug(f"Creating item with ID: {key} and price: {price}")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
         db.set(key, value)
-        db.publish("item_created", key)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        publish_event(
+            "stock_events", {"event": "item_created", "item_id": key, "price": price}
+        )
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when creating item: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return jsonify({"item_id": key})
 
 
 @app.post("/batch_init/<n>/<starting_stock>/<item_price>")
-def batch_init_users(n: int, starting_stock: int, item_price: int):
+def batch_init_items(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {
-        f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-        for i in range(n)
+    kv_pairs = {
+        str(uuid.uuid4()): msgpack.encode(
+            StockValue(stock=starting_stock, price=item_price)
+        )
+        for _ in range(n)
     }
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        app.logger.debug(
+            f"Batch initialized {n} items with stock: {starting_stock} and price: {item_price}"
+        )
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error during batch init: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
 
 
 @app.get("/find/<item_id>")
 def find_item(item_id: str):
-    item_entry: StockValue = get_item_from_db(item_id)
-    return jsonify({"stock": item_entry.stock, "price": item_entry.price})
+    item_entry = get_item_from_db(item_id)
+    return jsonify(
+        {"item_id": item_id, "stock": item_entry.stock, "price": item_entry.price}
+    )
 
 
 @app.post("/add/<item_id>/<amount>")
 def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
+    app.logger.debug(f"Adding {amount} stock to item: {item_id}")
+    item_entry = get_item_from_db(item_id)
     item_entry.stock += int(amount)
     try:
-        atomic_set_and_publish(
-            item_id, msgpack.encode(item_entry), "stock_events", "stock_added", item_id
+        db.set(item_id, msgpack.encode(item_entry))
+        publish_event(
+            "stock_events",
+            {"event": "stock_added", "item_id": item_id, "amount": amount},
         )
-        app.logger.info(f"Stock rollback successful for item {item_id}")
-    except redis.exceptions.RedisError:
-        publish_event("stock_events", "stock_add_failed", item_id)
-        app.logger.error(f"DB error during stock rollback for item {item_id}")
-        return abort(400, DB_ERROR_STR)
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when adding stock: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
 @app.post("/subtract/<item_id>/<amount>")
 def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        publish_event("stock_events", "stock_subtract_failed", item_id)
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+    app.logger.debug(f"Removing {amount} stock from item: {item_id}")
+    retries = 0
+    max_retries = 5
+    backoff_factor = 0.5
+
     try:
-        atomic_set_and_publish(
-            item_id,
-            msgpack.encode(item_entry),
-            "stock_events",
-            "stock_subtracted",
-            item_id,
-        )
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        with db.pipeline() as pipe:
+            while retries < max_retries:
+                try:
+                    pipe.watch(item_id)
+                    item_entry = get_item_from_db(item_id)
+                    if item_entry.stock < int(amount):
+                        pipe.unwatch()
+                        app.logger.error(
+                            f"Item: {item_id} stock cannot get reduced below zero!"
+                        )
+                        abort(
+                            400, f"Item: {item_id} stock cannot get reduced below zero!"
+                        )
+                    item_entry.stock -= int(amount)
+                    pipe.multi()
+                    pipe.set(item_id, msgpack.encode(item_entry))
+                    pipe.publish(
+                        "stock_events",
+                        msgpack.encode(
+                            {
+                                "event": "stock_subtracted",
+                                "item_id": item_id,
+                                "amount": amount,
+                            }
+                        ),
+                    )
+                    pipe.execute()
+                    app.logger.info(
+                        f"Item: {item_id} stock updated to: {item_entry.stock}"
+                    )
+                    break
+                except redis.WatchError as e:
+                    retries += 1
+                    app.logger.warning(
+                        f"WatchError occurred, retrying... attempt {retries}, error: {str(e)}"
+                    )
+                    time.sleep(backoff_factor * (2**retries))  # Exponential backoff
+                    continue
+                except redis.exceptions.RedisError as e:
+                    app.logger.error(f"DB error when removing stock: {str(e)}")
+                    abort(400, DB_ERROR_STR)
+            else:
+                app.logger.error(
+                    f"Failed to remove stock for item {item_id} after {max_retries} retries"
+                )
+                abort(500, "Failed to update stock after multiple retries")
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when removing stock: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
-
-def handle_event(message):
-    data = message["data"].decode("utf-8")
-    event_type, payload = data.split("|", 1)
-
-    if event_type == "order_created":
-        order_id = payload
-        app.logger.info(f"Order created with ID {order_id}")
-
-    elif event_type == "item_added":
-        order_id = payload
-        app.logger.info(f"Item added to order {order_id}")
-
-    elif event_type == "order_paid":
-        item_id, quantity = payload.split(",")
-        app.logger.info(
-            f"Order paid, stock subtracted for item {item_id}, quantity {quantity}"
-        )
-
-    elif event_type == "order_paid_failed":
-        item_id, quantity = payload.split(",")
-        app.logger.info(
-            f"Payment failed, rollback stock for item {item_id}, quantity {quantity}"
-        )
-        add_stock(item_id, quantity)
-
-
-def publish_event(channel: str, event_type: str, payload: str):
-    message = f"{event_type}|{payload}"
-    db.publish(channel, message)
-
-
-def atomic_set_and_publish(key, value, channel, event_type, payload):
-    pipeline = db.pipeline()
-    pipeline.set(key, value)
-    pipeline.publish(channel, f"{event_type}|{payload}")
-    pipeline.execute()
-
-
-def event_listener():
-    pubsub.subscribe(
-        **{
-            "order_created": handle_event,
-            "item_added": handle_event,
-            "order_paid": handle_event,
-            "order_paid_failed": handle_event,
-        }
-    )
-    pubsub.run_in_thread(sleep_time=1.0)
-
-
-event_listener()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8002, debug=True)

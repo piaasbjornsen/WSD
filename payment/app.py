@@ -5,16 +5,14 @@ import uuid
 import threading
 
 import redis
-
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 
-
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(
+db = redis.Redis(
     host=os.environ["REDIS_HOST"],
     port=int(os.environ["REDIS_PORT"]),
     password=os.environ["REDIS_PASSWORD"],
@@ -22,6 +20,21 @@ db: redis.Redis = redis.Redis(
 )
 
 pubsub = db.pubsub()
+pubsub.subscribe("payment_events")
+
+
+def publish_event(channel, event):
+    for attempt in range(3):
+        try:
+            db.publish(channel, msgpack.encode(event))
+            app.logger.debug(f"Event published: {event}")
+            return True
+        except redis.exceptions.RedisError as e:
+            app.logger.warning(
+                f"Failed to publish event: {event}, attempt {attempt+1}, error: {str(e)}"
+            )
+    app.logger.error(f"Failed to publish event after retries: {event}")
+    return False
 
 
 def close_db_connection():
@@ -37,14 +50,14 @@ class UserValue(Struct):
 
 def get_user_from_db(user_id: str) -> UserValue | None:
     try:
-        # get serialized data
-        entry: bytes = db.get(user_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
+        entry = db.get(user_id)
+        app.logger.debug(f"Retrieved user entry from DB: {entry}")
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when retrieving user {user_id}: {str(e)}")
+        abort(400, DB_ERROR_STR)
+    entry = msgpack.decode(entry, type=UserValue) if entry else None
     if entry is None:
-        # if user does not exist in the database; abort
+        app.logger.error(f"User: {user_id} not found!")
         abort(400, f"User: {user_id} not found!")
     return entry
 
@@ -55,8 +68,10 @@ def create_user():
     value = msgpack.encode(UserValue(credit=0))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        publish_event("payment_events", {"event": "user_created", "user_id": key})
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when creating user: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return jsonify({"user_id": key})
 
 
@@ -64,40 +79,38 @@ def create_user():
 def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {
-        f"{i}": msgpack.encode(UserValue(credit=starting_money)) for i in range(n)
+    kv_pairs = {
+        str(uuid.uuid4()): msgpack.encode(UserValue(credit=starting_money))
+        for _ in range(n)
     }
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error during batch init: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
 
 
 @app.get("/find_user/<user_id>")
 def find_user(user_id: str):
-    user_entry: UserValue = get_user_from_db(user_id)
+    user_entry = get_user_from_db(user_id)
     return jsonify({"user_id": user_id, "credit": user_entry.credit})
 
 
 @app.post("/add_funds/<user_id>/<amount>")
 def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
+    app.logger.debug(f"Adding {amount} credit to user: {user_id}")
+    user_entry = get_user_from_db(user_id)
     user_entry.credit += int(amount)
     try:
-        atomic_set_and_publish(
-            user_id,
-            msgpack.encode(user_entry),
+        db.set(user_id, msgpack.encode(user_entry))
+        publish_event(
             "payment_events",
-            "credit_added",
-            user_id,
+            {"event": "funds_added", "user_id": user_id, "amount": amount},
         )
-        app.logger.info(f"Credit rollback successful for user {user_id}")
-    except redis.exceptions.RedisError:
-        publish_event("payment_events", "credit_add_failed", user_id)
-        app.logger.error(f"DB error during credit rollback for user {user_id}")
-        return abort(400, DB_ERROR_STR)
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when adding funds: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return Response(
         f"User: {user_id} credit updated to: {user_entry.credit}", status=200
     )
@@ -106,74 +119,69 @@ def add_credit(user_id: str, amount: int):
 @app.post("/pay/<user_id>/<amount>")
 def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        publish_event("payment_events", "credit_remove_failed", user_id)
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
     try:
-        atomic_set_and_publish(
-            user_id,
-            msgpack.encode(user_entry),
-            "payment_events",
-            "credit_removed",
-            user_id,
+        with db.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(user_id)
+                    user_entry = get_user_from_db(user_id)
+                    if user_entry.credit < int(amount):
+                        pipe.unwatch()
+                        app.logger.error(f"User: {user_id} has insufficient credit")
+                        abort(
+                            400,
+                            f"User: {user_id} credit cannot get reduced below zero!",
+                        )
+                    user_entry.credit -= int(amount)
+                    pipe.multi()
+                    pipe.set(user_id, msgpack.encode(user_entry))
+                    pipe.execute()
+                    app.logger.info(
+                        f"User: {user_id} credit updated to: {user_entry.credit}"
+                    )
+
+                    if not publish_event(
+                        "payment_events",
+                        {
+                            "event": "payment_completed",
+                            "user_id": user_id,
+                            "amount": amount,
+                        },
+                    ):
+                        app.logger.error(
+                            f"Failed to publish payment event for user: {user_id}, rolling back"
+                        )
+                        with db.pipeline() as rollback_pipe:
+                            while True:
+                                try:
+                                    rollback_pipe.watch(user_id)
+                                    user_entry = get_user_from_db(user_id)
+                                    user_entry.credit += int(amount)
+                                    rollback_pipe.multi()
+                                    rollback_pipe.set(
+                                        user_id, msgpack.encode(user_entry)
+                                    )
+                                    rollback_pipe.execute()
+                                    break
+                                except redis.WatchError:
+                                    continue
+                        raise redis.exceptions.RedisError(
+                            "Failed to publish payment event"
+                        )
+                    break
+                except redis.WatchError as e:
+                    app.logger.warning(
+                        f"WatchError occurred, retrying... error: {str(e)}"
+                    )
+                    continue
+    except redis.exceptions.RedisError as e:
+        app.logger.error(
+            f"DB error when removing credit for user: {user_id}, error: {str(e)}"
         )
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
     return Response(
         f"User: {user_id} credit updated to: {user_entry.credit}", status=200
     )
-
-
-def handle_event(message):
-    data = message["data"].decode("utf-8")
-    event_type, payload = data.split("|", 1)
-
-    if event_type == "order_created":
-        order_id = payload
-        app.logger.info(f"Order created with ID {order_id}")
-
-    elif event_type == "item_added":
-        order_id = payload
-        app.logger.info(f"Item added to order {order_id}")
-
-    elif event_type == "order_paid":
-        user_id, total_cost = payload.split(",")
-        app.logger.info(f"Order paid by user {user_id}, total cost {total_cost}")
-
-    elif event_type == "order_paid_failed":
-        user_id, total_cost = payload.split(",")
-        app.logger.info(
-            f"Payment failed for user {user_id}, total cost {total_cost}, initiating rollback"
-        )
-        add_credit(user_id, total_cost)
-
-
-def publish_event(channel: str, event_type: str, payload: str):
-    message = f"{event_type}|{payload}"
-    db.publish(channel, message)
-
-
-def atomic_set_and_publish(key, value, channel, event_type, payload):
-    pipeline = db.pipeline()
-    pipeline.set(key, value)
-    pipeline.publish(channel, f"{event_type}|{payload}")
-    pipeline.execute()
-
-
-def event_listener():
-    pubsub.subscribe(
-        **{
-            "order_created": handle_event,
-            "item_added": handle_event,
-            "order_paid": handle_event,
-            "order_paid_failed": handle_event,
-        }
-    )
-    pubsub.run_in_thread(sleep_time=1.0)
-
 
 event_listener()
 
