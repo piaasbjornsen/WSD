@@ -3,6 +3,7 @@ import os
 import atexit
 import random
 import uuid
+import threading
 from collections import defaultdict
 import time
 
@@ -190,8 +191,6 @@ def add_item(order_id: str, item_id: str, quantity: int):
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
         status=200,
     )
-
-
 def handle_order_events():
     for message in pubsub.listen():
         if message["type"] == "message":
@@ -233,6 +232,12 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 def rollback_payment(user_id: str, amount: int):
     app.logger.debug(f"Rolling back payment for user {user_id} amount {amount}.")
     retry_post_request(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
+
+def rollback_stock_for_order(order_id):
+    order_entry = get_order_from_db(order_id)
+    for item_id, quantity in order_entry.items:
+        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+    app.logger.info(f"Rollback stock for order {order_id} completed")
 
 
 @app.post("/checkout/<order_id>")

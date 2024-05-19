@@ -3,6 +3,7 @@ import os
 import atexit
 import uuid
 import time
+import threading
 
 import redis
 from msgspec import msgpack, Struct
