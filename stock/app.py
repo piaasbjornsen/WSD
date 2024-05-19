@@ -94,20 +94,48 @@ def add_stock(item_id: str, amount: int):
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
+class StockValue(Struct):
+    stock: int
+    price: int
+    version: int = 0  # Add version field
+
 @app.post('/subtract/<item_id>/<amount>')
 def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+    while True:
+        try:
+            db.watch(item_id)
+            item_entry: StockValue = get_item_from_db(item_id)
+            if item_entry.stock < int(amount):
+                db.unwatch()
+                abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+            new_entry = StockValue(stock=item_entry.stock - int(amount), price=item_entry.price, version=item_entry.version + 1)
+            pipe = db.pipeline()
+            pipe.multi()
+            pipe.set(item_id, msgpack.encode(new_entry))
+            pipe.execute()
+            break
+        except redis.WatchError:
+            continue
+    return Response(f"Item: {item_id} stock updated to: {new_entry.stock}", status=200)
+
+
+
+
+@app.get('/find_all')
+def find_all_items():
     try:
-        db.set(item_id, msgpack.encode(item_entry))
+        # Get all keys matching the pattern
+        keys = db.keys('*')
+        items = {}
+        for key in keys:
+            item_entry: StockValue = get_item_from_db(key)
+            items[key.decode()] = {
+                "stock": item_entry.stock,
+                "price": item_entry.price
+            }
+        return jsonify(items)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
-
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

@@ -91,19 +91,32 @@ def add_credit(user_id: str, amount: int):
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
+class UserValue(Struct):
+    credit: int
+    version: int = 0  # Add version field
+
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    while True:
+        try:
+            db.watch(user_id)
+            user_entry: UserValue = get_user_from_db(user_id)
+            new_credit = user_entry.credit - int(amount)
+            if new_credit < 0:
+                db.unwatch()
+                abort(400, f"User: {user_id} credit cannot get reduced below zero!")
+            new_entry = UserValue(credit=new_credit, version=user_entry.version + 1)
+            pipe = db.pipeline()
+            pipe.multi()
+            pipe.set(user_id, msgpack.encode(new_entry))
+            pipe.execute()
+            break
+        except redis.WatchError:
+            continue
+    return Response(f"User: {user_id} credit updated to: {new_entry.credit}", status=200)
+
+
+
 
 
 if __name__ == '__main__':
