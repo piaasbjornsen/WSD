@@ -4,6 +4,7 @@ import atexit
 import random
 import uuid
 from collections import defaultdict
+import time
 
 import redis
 import requests
@@ -33,15 +34,17 @@ def publish_event(channel, event):
     for _ in range(3):  # Retry 3 times
         try:
             db.publish(channel, msgpack.encode(event))
+            app.logger.info(f"Published event: {event}")
             return True
-        except redis.exceptions.RedisError:
-            continue
-    app.logger.error(f"Failed to publish event: {event}")
+        except redis.exceptions.RedisError as e:
+            app.logger.warning(f"Failed to publish event {event} on attempt: {e}")
+    app.logger.error(f"Failed to publish event after retries: {event}")
     return False
 
 
 def close_db_connection():
     db.close()
+    app.logger.info("Closed database connection.")
 
 
 atexit.register(close_db_connection)
@@ -57,10 +60,13 @@ class OrderValue(Struct):
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         entry: bytes = db.get(order_id)
-    except redis.exceptions.RedisError:
+        app.logger.debug(f"Retrieved order {order_id} from DB.")
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when retrieving order {order_id}: {str(e)}")
         abort(400, DB_ERROR_STR)
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
+        app.logger.error(f"Order: {order_id} not found!")
         abort(400, f"Order: {order_id} not found!")
     return entry
 
@@ -73,17 +79,19 @@ def create_order(user_id: str):
     )
     try:
         db.set(key, value)
+        app.logger.info(f"Created order {key} for user {user_id}.")
         publish_event(
             "order_events",
             {"event": "order_created", "order_id": key, "user_id": user_id},
         )
-    except redis.exceptions.RedisError:
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when creating order: {str(e)}")
         abort(400, DB_ERROR_STR)
     return jsonify({"order_id": key})
 
 
 @app.post("/batch_init/<n>/<n_items>/<n_users>/<item_price>")
-def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
+def batch_init_orders(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
@@ -102,17 +110,20 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         return value
 
     kv_pairs: dict[str, bytes] = {
-        f"{i}": msgpack.encode(generate_entry()) for i in range(n)
+        str(uuid.uuid4()): msgpack.encode(generate_entry()) for _ in range(n)
     }
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+        app.logger.info(f"Batch initialized {n} orders.")
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error during batch init: {str(e)}")
         abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
 
 @app.get("/find/<order_id>")
 def find_order(order_id: str):
+    app.logger.debug(f"Finding order {order_id}.")
     order_entry: OrderValue = get_order_from_db(order_id)
     return jsonify(
         {
@@ -126,34 +137,43 @@ def find_order(order_id: str):
 
 
 def send_post_request(url: str):
+    app.logger.debug(f"Sending POST request to {url}.")
     try:
         response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
+        response.raise_for_status()
         return response
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Request error: {str(e)}")
+        abort(400, REQ_ERROR_STR)
 
 
 def send_get_request(url: str):
+    app.logger.debug(f"Sending GET request to {url}.")
     try:
         response = requests.get(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
+        response.raise_for_status()
         return response
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Request error: {str(e)}")
+        abort(400, REQ_ERROR_STR)
 
 
 @app.post("/addItem/<order_id>/<item_id>/<quantity>")
 def add_item(order_id: str, item_id: str, quantity: int):
+    app.logger.debug(
+        f"Adding item {item_id} to order {order_id} with quantity {quantity}."
+    )
     order_entry: OrderValue = get_order_from_db(order_id)
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
+        app.logger.error(f"Item {item_id} does not exist!")
         abort(400, f"Item: {item_id} does not exist!")
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
     try:
         db.set(order_id, msgpack.encode(order_entry))
+        app.logger.info(f"Item {item_id} added to order {order_id}.")
         publish_event(
             "order_events",
             {
@@ -163,7 +183,8 @@ def add_item(order_id: str, item_id: str, quantity: int):
                 "quantity": quantity,
             },
         )
-    except redis.exceptions.RedisError:
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error when adding item: {str(e)}")
         abort(400, DB_ERROR_STR)
     return Response(
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
@@ -182,35 +203,41 @@ def handle_order_events():
                 try:
                     db.set(order_id, msgpack.encode(order))
                     app.logger.info(f"Order {order_id} marked as paid.")
-                except redis.exceptions.RedisError:
-                    app.logger.error(f"Failed to update order {order_id}.")
+                except redis.exceptions.RedisError as e:
+                    app.logger.error(f"Failed to update order {order_id}: {str(e)}")
 
 
-def retry_post_request(url: str, max_retries: int = 3):
+def retry_post_request(url: str, max_retries: int = 3, backoff_factor: float = 0.5):
+    app.logger.debug(f"Retrying POST request to {url} with max retries {max_retries}.")
     for attempt in range(max_retries):
         try:
             response = requests.post(url)
             if response.status_code == 200:
                 return response
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            app.logger.warning(
+                f"Request error on attempt {attempt+1} for URL {url}: {str(e)}"
+            )
             if attempt == max_retries - 1:
                 abort(400, "Failed to send POST request after several attempts")
-            continue
+            time.sleep(backoff_factor * (2**attempt))
     return None
 
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
+    app.logger.debug(f"Rolling back stock for items: {removed_items}")
     for item_id, quantity in removed_items:
         retry_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
 
 def rollback_payment(user_id: str, amount: int):
+    app.logger.debug(f"Rolling back payment for user {user_id} amount {amount}.")
     retry_post_request(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
 
 
 @app.post("/checkout/<order_id>")
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.debug(f"Checking out order {order_id}.")
     order_entry: OrderValue = get_order_from_db(order_id)
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
@@ -221,6 +248,7 @@ def checkout(order_id: str):
             f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}"
         )
         if not stock_reply or stock_reply.status_code != 200:
+            app.logger.error(f"Out of stock for item {item_id}. Rolling back.")
             rollback_stock(removed_items)
             abort(400, f"Out of stock on item_id: {item_id}")
         removed_items.append((item_id, quantity))
@@ -228,17 +256,20 @@ def checkout(order_id: str):
         f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}"
     )
     if not user_reply or user_reply.status_code != 200:
+        app.logger.error(f"User {order_entry.user_id} out of credit. Rolling back.")
         rollback_stock(removed_items)
         rollback_payment(order_entry.user_id, order_entry.total_cost)
         abort(400, "User out of credit")
     order_entry.paid = True
     try:
         db.set(order_id, msgpack.encode(order_entry))
+        app.logger.info(f"Checkout successful for order {order_id}.")
         publish_event(
             "order_events", {"event": "payment_completed", "order_id": order_id}
         )
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error during checkout for order {order_id}: {str(e)}")
+        abort(400, DB_ERROR_STR)
     return Response("Checkout successful", status=200)
 
 
