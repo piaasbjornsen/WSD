@@ -107,11 +107,15 @@ def add_credit(user_id: str, amount: int):
 def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
     user_entry: UserValue = get_user_from_db(user_id)
+    if user_entry.credit < int(amount):
+        app.logger.error(
+            f"Credit inconsistency, Amount: {amount}, Available: {user_entry.credit}"
+        )
+        # Not enough credit, publish failed event and abort
+        publish_event("payment_events", "credit_remove_failed", user_id)
+        abort(400, f"User: {user_id} does not have enough credit!")
     # update credit, serialize and update database
     user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        publish_event("payment_events", "credit_remove_failed", user_id)
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
     try:
         atomic_set_and_publish(
             user_id,
@@ -158,9 +162,14 @@ def publish_event(channel: str, event_type: str, payload: str):
 
 def atomic_set_and_publish(key, value, channel, event_type, payload):
     pipeline = db.pipeline()
-    pipeline.set(key, value)
-    pipeline.publish(channel, f"{event_type}|{payload}")
-    pipeline.execute()
+    try:
+        pipeline.set(key, value)
+        pipeline.publish(channel, f"{event_type}|{payload}")
+        pipeline.execute()
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"Redis error: {e}")
+        print(DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
 
 
 def event_listener():

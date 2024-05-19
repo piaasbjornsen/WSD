@@ -165,11 +165,15 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
         send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
 
-def rollback_stock_for_order(order_id):
+def rollback_credit(user_id: str, amount: int):
+    send_post_request(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
+
+
+def rollback_order(order_id: str):
     order_entry = get_order_from_db(order_id)
-    for item_id, quantity in order_entry.items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-    app.logger.info(f"Rollback stock for order {order_id} completed")
+    rollback_stock(order_entry.items)
+    rollback_credit(order_entry.user_id, order_entry.total_cost)
+    app.logger.info(f"Rollback for order {order_id} completed")
 
 
 @app.post("/checkout/<order_id>")
@@ -207,7 +211,13 @@ def checkout(order_id: str):
         abort(400, "User out of credit")
     order_entry.paid = True
     try:
-        atomic_set_and_publish(order_id, msgpack.encode(order_entry), "order_events", "order_paid", order_id)
+        atomic_set_and_publish(
+            order_id,
+            msgpack.encode(order_entry),
+            "order_events",
+            "order_paid",
+            order_id,
+        )
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     app.logger.debug("Checkout successful")
@@ -238,14 +248,14 @@ def handle_event(message):
             app.logger.info(
                 f"Stock subtraction failed for order {order_id}, initiating rollback"
             )
-            rollback_stock_for_order(order_id)
+            rollback_order(order_id)
 
         elif event_type == "credit_remove_failed":
             order_id = payload
             app.logger.info(
                 f"Credit removal failed for order {order_id}, initiating rollback"
             )
-            rollback_stock_for_order(order_id)
+            rollback_order(order_id)
 
         else:
             app.logger.error(f"Unknown event type received: {event_type}")
@@ -258,9 +268,14 @@ def handle_event(message):
 
 def atomic_set_and_publish(key, value, channel, event_type, payload):
     pipeline = db.pipeline()
-    pipeline.set(key, value)
-    pipeline.publish(channel, f"{event_type}|{payload}")
-    pipeline.execute()
+    try:
+        pipeline.set(key, value)
+        pipeline.publish(channel, f"{event_type}|{payload}")
+        pipeline.execute()
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"Redis error: {e}")
+        print(DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
 
 
 def publish_event(channel: str, event_type: str, payload: str):

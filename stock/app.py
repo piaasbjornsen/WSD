@@ -105,12 +105,23 @@ def add_stock(item_id: str, amount: int):
 @app.post("/subtract/<item_id>/<amount>")
 def remove_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
+    app.logger.debug(
+        f"Before subtract - Item ID: {item_id}, Current Stock: {item_entry.stock}, Amount: {amount}"
+    )
+
     # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
+    if item_entry.stock < int(amount):
+        app.logger.error(
+            f"Stock inconsistency - Item ID: {item_id}, Requested: {amount}, Available: {item_entry.stock}"
+        )
         publish_event("stock_events", "stock_subtract_failed", item_id)
         abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+
+    item_entry.stock -= int(amount)
+    app.logger.debug(
+        f"After subtract - Item ID: {item_id}, New Stock: {item_entry.stock}"
+    )
+
     try:
         atomic_set_and_publish(
             item_id,
@@ -157,9 +168,14 @@ def publish_event(channel: str, event_type: str, payload: str):
 
 def atomic_set_and_publish(key, value, channel, event_type, payload):
     pipeline = db.pipeline()
-    pipeline.set(key, value)
-    pipeline.publish(channel, f"{event_type}|{payload}")
-    pipeline.execute()
+    try:
+        pipeline.set(key, value)
+        pipeline.publish(channel, f"{event_type}|{payload}")
+        pipeline.execute()
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"Redis error: {e}")
+        print(DB_ERROR_STR)
+        abort(400, DB_ERROR_STR)
 
 
 def event_listener():
