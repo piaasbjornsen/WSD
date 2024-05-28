@@ -127,7 +127,8 @@ def remove_credit(user_id: str, amount: int):
                     user_entry = get_user_from_db(user_id)
                     if user_entry.credit < int(amount):
                         pipe.unwatch()
-                        app.logger.error(f"User: {user_id} has insufficient credit")
+                        app.logger.error(f"User: {user_id} has insufficient credit"),
+                        
                         abort(
                             400,
                             f"User: {user_id} credit cannot get reduced below zero!",
@@ -183,9 +184,29 @@ def remove_credit(user_id: str, amount: int):
         f"User: {user_id} credit updated to: {user_entry.credit}", status=200
     )
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8001, debug=True)
+
+def handle_event(event):
+    event_type = event.get("event")
+    if event_type == "inventory_reserved":
+        user_id = event["user_id"]
+        total_cost = event_data['total_cost']
+        order_id = event_data['order_id']
+        items = event_data['items']
+        remove_credit(user_id, total_cost)
+
+def consume_events():
+    for message in pubsub.listen():
+        if message["type"] == "message":
+            event = msgpack.decode(message["data"])
+            handle_event(event)
+
+
+if __name__ == '__main__':
+    # Start the event consumer in a separate thread
+    consumer_thread = threading.Thread(target=consume_events)
+    consumer_thread.start()
+    app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger("gunicorn.error")
+    gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
