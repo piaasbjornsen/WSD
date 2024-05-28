@@ -16,7 +16,7 @@ kind: Deployment
 metadata:
   name: stock-deployment
 spec:
-  replicas: 1
+  replicas: 3  # Increased replicas for redundancy
   selector:
     matchLabels:
       component: stock
@@ -48,3 +48,19 @@ spec:
               value: "redis"
             - name: REDIS_DB
               value: "0"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+met

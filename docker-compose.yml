@@ -1,4 +1,4 @@
-version: "3"
+version: "3.8"
 services:
 
   gateway:
@@ -22,10 +22,22 @@ services:
       - env/order_redis.env
     depends_on:
       - order-db
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 2
+        delay: 10s
+      restart_policy:
+        condition: on-failure
 
   order-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+    volumes:
+      - order-db-data:/data
+    deploy:
+      restart_policy:
+        condition: on-failure
 
   stock-service:
     build: ./stock
@@ -35,10 +47,22 @@ services:
       - env/stock_redis.env
     depends_on:
       - stock-db
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 2
+        delay: 10s
+      restart_policy:
+        condition: on-failure
 
   stock-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+    volumes:
+      - stock-db-data:/data
+    deploy:
+      restart_policy:
+        condition: on-failure
 
   payment-service:
     build: ./payment
@@ -48,7 +72,24 @@ services:
       - env/payment_redis.env
     depends_on:
       - payment-db
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 2
+        delay: 10s
+      restart_policy:
+        condition: on-failure
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+    volumes:
+      - payment-db-data:/data
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:
