@@ -26,37 +26,37 @@ db: redis.Redis = redis.Redis(
     password=os.environ["REDIS_PASSWORD"],
     db=int(os.environ["REDIS_DB"]),
 )
-
+# Create a pub/sub object from the Redis db, used to subscribe and publish to channels 
 pubsub = db.pubsub()
-pubsub.subscribe("order_events")
 
+# Subscribe to order, stock and payment service channels
+pubsub.subscribe("order_events", "stock_events", "payment_events")
 
+# Function to publish events to channel
 def publish_event(channel, event):
-    for _ in range(3):  # Retry 3 times
+    retry = 3       
+    for _ in range(retry):  
         try:
             db.publish(channel, msgpack.encode(event))
             app.logger.info(f"Published event: {event}")
             return True
         except redis.exceptions.RedisError as e:
             app.logger.warning(f"Failed to publish event {event} on attempt: {e}")
-    app.logger.error(f"Failed to publish event after retries: {event}")
+    app.logger.error(f"Failed to publish event after {retry} retries: {event}")
     return False
-
 
 def close_db_connection():
     db.close()
     app.logger.info("Closed database connection.")
 
-
 atexit.register(close_db_connection)
 
-
+# Creates an OrderValue class, with key equal order_id
 class OrderValue(Struct):
     paid: bool
     items: list[tuple[str, int]]
     user_id: str
     total_cost: int
-
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
@@ -72,6 +72,7 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
     return entry
 
 
+# Create an empty order, with user_id and order_id
 @app.post("/create/<user_id>")
 def create_order(user_id: str):
     key = str(uuid.uuid4())
@@ -81,15 +82,10 @@ def create_order(user_id: str):
     try:
         db.set(key, value)
         app.logger.info(f"Created order {key} for user {user_id}.")
-        publish_event(
-            "order_events",
-            {"event": "order_created", "order_id": key, "user_id": user_id},
-        )
     except redis.exceptions.RedisError as e:
         app.logger.error(f"DB error when creating order: {str(e)}")
         abort(400, DB_ERROR_STR)
     return jsonify({"order_id": key})
-
 
 @app.post("/batch_init/<n>/<n_items>/<n_users>/<item_price>")
 def batch_init_orders(n: int, n_items: int, n_users: int, item_price: int):
@@ -121,7 +117,6 @@ def batch_init_orders(n: int, n_items: int, n_users: int, item_price: int):
         abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
-
 @app.get("/find/<order_id>")
 def find_order(order_id: str):
     app.logger.debug(f"Finding order {order_id}.")
@@ -136,7 +131,6 @@ def find_order(order_id: str):
         }
     )
 
-
 def send_post_request(url: str):
     app.logger.debug(f"Sending POST request to {url}.")
     try:
@@ -146,7 +140,6 @@ def send_post_request(url: str):
     except requests.exceptions.RequestException as e:
         app.logger.error(f"Request error: {str(e)}")
         abort(400, REQ_ERROR_STR)
-
 
 def send_get_request(url: str):
     app.logger.debug(f"Sending GET request to {url}.")
@@ -158,14 +151,13 @@ def send_get_request(url: str):
         app.logger.error(f"Request error: {str(e)}")
         abort(400, REQ_ERROR_STR)
 
-
 @app.post("/addItem/<order_id>/<item_id>/<quantity>")
 def add_item(order_id: str, item_id: str, quantity: int):
     app.logger.debug(
         f"Adding item {item_id} to order {order_id} with quantity {quantity}."
     )
     order_entry: OrderValue = get_order_from_db(order_id)
-    item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
+    item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}") 
     if item_reply.status_code != 200:
         app.logger.error(f"Item {item_id} does not exist!")
         abort(400, f"Item: {item_id} does not exist!")
@@ -175,15 +167,6 @@ def add_item(order_id: str, item_id: str, quantity: int):
     try:
         db.set(order_id, msgpack.encode(order_entry))
         app.logger.info(f"Item {item_id} added to order {order_id}.")
-        publish_event(
-            "order_events",
-            {
-                "event": "item_added",
-                "order_id": order_id,
-                "item_id": item_id,
-                "quantity": quantity,
-            },
-        )
     except redis.exceptions.RedisError as e:
         app.logger.error(f"DB error when adding item: {str(e)}")
         abort(400, DB_ERROR_STR)
@@ -191,96 +174,92 @@ def add_item(order_id: str, item_id: str, quantity: int):
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
         status=200,
     )
-def handle_order_events():
-    for message in pubsub.listen():
-        if message["type"] == "message":
-            event = msgpack.decode(message["data"])
-            if event["event"] == "payment_completed":
-                order_id = event["order_id"]
-                order = get_order_from_db(order_id)
-                order.paid = True
-                try:
-                    db.set(order_id, msgpack.encode(order))
-                    app.logger.info(f"Order {order_id} marked as paid.")
-                except redis.exceptions.RedisError as e:
-                    app.logger.error(f"Failed to update order {order_id}: {str(e)}")
 
-
-def retry_post_request(url: str, max_retries: int = 3, backoff_factor: float = 0.5):
-    app.logger.debug(f"Retrying POST request to {url} with max retries {max_retries}.")
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url)
-            if response.status_code == 200:
-                return response
-        except requests.exceptions.RequestException as e:
-            app.logger.warning(
-                f"Request error on attempt {attempt+1} for URL {url}: {str(e)}"
-            )
-            if attempt == max_retries - 1:
-                abort(400, "Failed to send POST request after several attempts")
-            time.sleep(backoff_factor * (2**attempt))
-    return None
-
-
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    app.logger.debug(f"Rolling back stock for items: {removed_items}")
-    for item_id, quantity in removed_items:
-        retry_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
-def rollback_payment(user_id: str, amount: int):
-    app.logger.debug(f"Rolling back payment for user {user_id} amount {amount}.")
-    retry_post_request(f"{GATEWAY_URL}/payment/add_funds/{user_id}/{amount}")
-
-def rollback_stock_for_order(order_id):
-    order_entry = get_order_from_db(order_id)
-    for item_id, quantity in order_entry.items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-    app.logger.info(f"Rollback stock for order {order_id} completed")
-
-
-@app.post("/checkout/<order_id>")
+@app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out order {order_id}.")
+    app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = retry_post_request(
-            f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}"
-        )
-        if not stock_reply or stock_reply.status_code != 200:
-            app.logger.error(f"Out of stock for item {item_id}. Rolling back.")
-            rollback_stock(removed_items)
-            abort(400, f"Out of stock on item_id: {item_id}")
-        removed_items.append((item_id, quantity))
-    user_reply = retry_post_request(
-        f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}"
+    publish_event( 
+        "order_events",
+            {
+                "event": "order_checkout",
+                "user_id": order_entry.user_id,         
+                "order_id": order_id,
+                "total_cost": order_entry.total_cost,
+                "items": list(items_quantities.items())         # Keep this as dictionary!
+            },
     )
-    if not user_reply or user_reply.status_code != 200:
-        app.logger.error(f"User {order_entry.user_id} out of credit. Rolling back.")
-        rollback_stock(removed_items)
-        rollback_payment(order_entry.user_id, order_entry.total_cost)
-        abort(400, "User out of credit")
-    order_entry.paid = True
+    return Response("Checkout initiated", status=200)
+
+def handle_event(event):
+    event_type = event.get("event")
+    if event_type == "payment_completed":
+        handle_payment_completed(event)
+    elif event_type == "payment_failed":
+        handle_payment_failed(event)
+    elif event_type == "inventory_not_available":
+        handle_inventory_na(event)
+    elif event_type == "inventory_reserved":
+        handle_inventory_reserved()
+
+    # Add more event types and handlers as needed
+
+
+
+def handle_payment_completed(event):
+    # Handle payment completion logic
+    order_id = event["order_id"]
+    order = get_order_from_db(order_id)
+    order.paid = True
     try:
-        db.set(order_id, msgpack.encode(order_entry))
-        app.logger.info(f"Checkout successful for order {order_id}.")
-        publish_event(
-            "order_events", {"event": "payment_completed", "order_id": order_id}
-        )
+        db.set(order_id, msgpack.encode(order))
+        app.logger.info(f"Order {order_id} marked as paid.")
+
     except redis.exceptions.RedisError as e:
-        app.logger.error(f"DB error during checkout for order {order_id}: {str(e)}")
-        abort(400, DB_ERROR_STR)
-    return Response("Checkout successful", status=200)
+        app.logger.error(f"Failed to update order {order_id}: {str(e)}")        # Should this return 400?
+
+def handle_payment_failed(event):
+    # Handle payment failure logic and compensation
+    item_id = event["item_id"]
+    amount = event["amount"]
+    publish_event(
+        "order_events",
+        {
+            "event": "order_compensation",
+            "item_id": item_id,
+            "amount" : amount, 
+            
+          }
+    
+    )
 
 
-if __name__ == "__main__":
+def handle_inventory_na(event):
+
+    publish_event(
+            "order_events",
+            {
+                "event": "order_cancelled",
+            }
+        )
+    
+def handle_inventory_reserved():
+
+def consume_events():
+    for message in pubsub.listen():
+        if message["type"] == "message":
+            event = msgpack.decode(message["data"])
+            handle_event(event)
+
+if __name__ == '__main__':
+    # Start the event consumer in a separate thread
+    consumer_thread = threading.Thread(target=consume_events)
+    consumer_thread.start()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger("gunicorn.error")
+    gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
