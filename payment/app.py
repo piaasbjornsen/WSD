@@ -183,8 +183,6 @@ def remove_credit(user_id: str, amount: int):
         f"User: {user_id} credit updated to: {user_entry.credit}", status=200
     )
 
-event_listener()
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8001, debug=True)
 else:
