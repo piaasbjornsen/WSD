@@ -63,4 +63,13 @@ spec:
 ---
 apiVersion: autoscaling/v1
 kind: HorizontalPodAutoscaler
-met
+metadata:
+  name: stock-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: stock-deployment
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
