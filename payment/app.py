@@ -20,10 +20,13 @@ db = redis.Redis(
 )
 
 pubsub = db.pubsub()
-pubsub.subscribe("payment_events")
+pubsub.subscribe("stock_events", "payment_events", "order_events")
 
 
 def publish_event(channel, event):
+    """
+    Publish an event to a Redis channel, with retries on failure.
+    """
     for attempt in range(3):
         try:
             db.publish(channel, msgpack.encode(event))
@@ -38,9 +41,12 @@ def publish_event(channel, event):
 
 
 def close_db_connection():
+    """
+    Close the Redis connection on application exit.
+    """
     db.close()
 
-
+# Register the database connection close function to be called on exit
 atexit.register(close_db_connection)
 
 
@@ -119,86 +125,144 @@ def add_credit(user_id: str, amount: int):
 @app.post("/pay/<user_id>/<amount>")
 def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
+    user_entry: UserValue = get_user_from_db(user_id)
+    # update credit, serialize and update database
+    user_entry.credit -= int(amount)
+    if user_entry.credit < 0:
+        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
     try:
-        with db.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(user_id)
-                    user_entry = get_user_from_db(user_id)
-                    if user_entry.credit < int(amount):
-                        pipe.unwatch()
-                        app.logger.error(f"User: {user_id} has insufficient credit"),
-                        
-                        abort(
-                            400,
-                            f"User: {user_id} credit cannot get reduced below zero!",
-                        )
-                    user_entry.credit -= int(amount)
-                    pipe.multi()
-                    pipe.set(user_id, msgpack.encode(user_entry))
-                    pipe.execute()
-                    app.logger.info(
-                        f"User: {user_id} credit updated to: {user_entry.credit}"
-                    )
+        db.set(user_id, msgpack.encode(user_entry))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
-                    if not publish_event(
-                        "payment_events",
-                        {
-                            "event": "payment_completed",
-                            "user_id": user_id,
-                            "amount": amount,
-                        },
-                    ):
-                        app.logger.error(
-                            f"Failed to publish payment event for user: {user_id}, rolling back"
-                        )
-                        with db.pipeline() as rollback_pipe:
-                            while True:
-                                try:
-                                    rollback_pipe.watch(user_id)
-                                    user_entry = get_user_from_db(user_id)
-                                    user_entry.credit += int(amount)
-                                    rollback_pipe.multi()
-                                    rollback_pipe.set(
-                                        user_id, msgpack.encode(user_entry)
-                                    )
-                                    rollback_pipe.execute()
-                                    break
-                                except redis.WatchError:
-                                    continue
-                        raise redis.exceptions.RedisError(
-                            "Failed to publish payment event"
-                        )
-                    break
-                except redis.WatchError as e:
-                    app.logger.warning(
-                        f"WatchError occurred, retrying... error: {str(e)}"
-                    )
-                    continue
-    except redis.exceptions.RedisError as e:
-        app.logger.error(
-            f"DB error when removing credit for user: {user_id}, error: {str(e)}"
+
+def handle_payment_reserve(event):
+    """
+    Handle payment reservation event by deducting the reserved amount from user's credit.
+    """
+    order_id = event["order_id"]
+    user_id = event["user_id"]
+    total_cost = event["total_cost"]
+    items = event["items"]
+
+    try:
+        # Retrieve user information from the database
+        user_entry = get_user_from_db(user_id)
+
+        # Check if user has enough credit for the payment
+        if user_entry.credit < total_cost:
+            # Publish event indicating payment failure due to insufficient credit
+            publish_event(
+                "payment_events",
+                {
+                    "event": "payment_failed",
+                    "order_id": order_id,
+                    "user_id": user_id,
+                    "total_cost": total_cost,
+                    "items": items
+                }
+            )
+            app.logger.error(f"Payment failed for order: {order_id}, user: {user_id}. Insufficient credit.")
+            return Response("Insufficient credit. Payment failed.", status=400)
+
+        # Deduct the total cost of the reserved items from the user's credit
+        user_entry.credit -= total_cost
+
+        # Update user's credit in the database
+        db.set(user_id, msgpack.encode(user_entry))
+
+        app.logger.info(f"Payment reserved for order: {order_id}, user: {user_id}")
+
+        # Publish event indicating successful payment reservation
+        publish_event(
+            "payment_events",
+            {
+                "event": "payment_completed",
+                "order_id": order_id,
+                "user_id": user_id,
+                "total_cost": total_cost,
+                "items": items
+            }
         )
-        abort(400, DB_ERROR_STR)
-    return Response(
-        f"User: {user_id} credit updated to: {user_entry.credit}", status=200
-    )
+        return Response("Payment reserved successfully", status=200)
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error during payment reservation: {str(e)}")
+        # Publish an event indicating that the credit reservation failed
+        publish_event(
+            "payment_events",
+            {
+                "event": "payment_failed",
+                "order_id": order_id,
+                "user_id": user_id,
+                "total_cost": total_cost,
+                "items": items
+            }
+        )
+        return abort(400, DB_ERROR_STR)
 
 
-def handle_event(event):
-    event_type = event.get("event")
-    if event_type == "inventory_reserved":
-        user_id = event["user_id"]
-        total_cost = event_data['total_cost']
-        order_id = event_data['order_id']
-        items = event_data['items']
-        remove_credit(user_id, total_cost)
+def handle_payment_compensation(event):
+    """
+    Handle payment compensation event by adding back the reserved amount to the user's credit.
+    """
+    order_id = event["order_id"]
+    user_id = event["user_id"]
+    total_cost = event["total_cost"]
+    items = event["items"]
+
+    try:
+        # Retrieve user information from the database
+        user_entry = get_user_from_db(user_id)
+
+        # Add the total cost of the reserved items back to the user's credit
+        user_entry.credit += total_cost
+
+        # Update user's credit in the database
+        db.set(user_id, msgpack.encode(user_entry))
+
+        app.logger.info(f"Payment compensation for order: {order_id}, user: {user_id}")
+
+        # Publish event indicating successful payment compensation
+        publish_event(
+            "payment_events",
+            {
+                "event": "payment_compensated",
+                "order_id": order_id,
+                "user_id": user_id,
+                "total_cost": total_cost,
+                "items": items
+            }
+        )
+
+        return Response("Payment compensation successful", status=200)
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"DB error during payment compensation: {str(e)}")
+        # Publish an event indicating that the payment compensation failed
+        publish_event(
+            "payment_events",
+            {
+                "event": "payment_compensation_failed",
+                "order_id": order_id,
+                "user_id": user_id,
+                "total_cost": total_cost,
+                "items": items
+            }
+        )
+        return Response("Payment compensation failed", status=400)
+
 
 def consume_events():
+    """
+    Consume and handle events from the Redis Pub/Sub channels.
+    """
     for message in pubsub.listen():
-        if message["type"] == "message":
-            event = msgpack.decode(message["data"])
-            handle_event(event)
+        event = msgpack.decode(message["data"])
+        event_type = event.get("event")
+        if event_type == "inventory_reserved":
+            handle_payment_reserve(event)
+        elif event_type == "order_compensation":
+            handle_payment_compensation(event)
 
 
 if __name__ == '__main__':

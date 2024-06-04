@@ -194,65 +194,61 @@ def checkout(order_id: str):
     )
     return Response("Checkout initiated", status=200)
 
-def handle_event(event):
-    event_type = event.get("event")
-    if event_type == "payment_completed":
-        handle_payment_completed(event)
-    elif event_type == "payment_failed":
-        handle_payment_failed(event)
-    elif event_type == "inventory_not_available":
-        handle_inventory_na(event)
-    elif event_type == "inventory_reserved":
-        handle_inventory_reserved()
-
-    # Add more event types and handlers as needed
-
-
 
 def handle_payment_completed(event):
-    # Handle payment completion logic
+    """
+    Handle the event when payment is completed.
+    """
     order_id = event["order_id"]
-    order = get_order_from_db(order_id)
-    order.paid = True
+    user_id = event["user_id"]
+    total_cost = event["total_cost"]
+    items = event["items"]
+
     try:
-        db.set(order_id, msgpack.encode(order))
+        # Retrieve order information from the database
+        order_entry = get_order_from_db(order_id)
+
+        # Update the order entry to mark it as paid
+        order_entry.paid = True
+
+        # Save the updated order entry to the database
+        db.set(order_id, msgpack.encode(order_entry))
         app.logger.info(f"Order {order_id} marked as paid.")
 
+        return Response("Payment completed. Order marked as paid.", status=200)
     except redis.exceptions.RedisError as e:
-        app.logger.error(f"Failed to update order {order_id}: {str(e)}")        # Should this return 400?
+        app.logger.error(f"DB error when marking order {order_id} as paid: {str(e)}")
 
-def handle_payment_failed(event):
-    # Handle payment failure logic and compensation
-    item_id = event["item_id"]
-    amount = event["amount"]
-    publish_event(
-        "order_events",
-        {
-            "event": "order_compensation",
-            "item_id": item_id,
-            "amount" : amount, 
-            
-          }
-    
-    )
-
-
-def handle_inventory_na(event):
-
-    publish_event(
+        # Publish an event indicating that payment compensation is required
+        publish_event(
             "order_events",
             {
-                "event": "order_cancelled",
+                "event": "order_compensation",
+                "order_id": order_id,
+                "user_id": user_id,
+                "total_cost": total_cost,
+                "items": items
             }
         )
-    
-def handle_inventory_reserved():
+
+        return Response("Failed to mark order as paid. Order compensation initiated.", status=500)
+
 
 def consume_events():
+    """
+    Consume and handle events from the Redis Pub/Sub channels.
+    """
     for message in pubsub.listen():
-        if message["type"] == "message":
-            event = msgpack.decode(message["data"])
-            handle_event(event)
+        event = msgpack.decode(message["data"])
+        event_type = event.get("event")
+        # We don't need stock_reserved since if it is reserved, payment service will consume this to "reserve credit"
+        # We don't need stock_na (not available) since we're using pipeline that executes the operations as a single atomic operation -> It will not make changes to the stock if it fails.
+        # If payment failed, we can directly just let stock subcribe to the event and rollback itself
+
+        #If payment completed, then we can try to checkout successfully!
+        if event_type == "payment_completed":
+            handle_payment_completed(event)
+
 
 if __name__ == '__main__':
     # Start the event consumer in a separate thread
