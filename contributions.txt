@@ -12,4 +12,9 @@ Gio
 - Worked on documenting section of phase 1
 - Worked on implmenenting atomicity
 - Worked on fixing Minikube implementation
+
 Ching
+- Worked on Transaction Protocol & Choreography vs Orchestration part of phase 1 report.
+- Tried Minikube implementation but couldn't get it working.
+- Worked on Sagas choreography using event handlers for phase 3, but the event handlers did not work properly.
+- Worked on Sagas choreography entire flow.
