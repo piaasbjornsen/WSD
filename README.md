@@ -52,6 +52,7 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
 `docker-compose ps`
 
 `docker kill wdm24-4-order-service-1-1`
+`docker start wdm24-4-order-service-1-1`
 
 `sleep 30`
 `docker-compose ps`
