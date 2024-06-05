@@ -46,15 +46,22 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
 
 **_Requirements:_** You need to have access to kubectl of a k8s cluster.
 
-### Testing fault tolerance
+### Phase 2 - Implement transactional protocol
+Implemented SAGAs choreography that ensures transactions check for the availablility of stock and funds before executing an order. When one of the services fails, changes in the database are rolled back and hte order is cancelled.
+
+### Phase 3 - Testing fault tolerance
+With docker compose, implemented redundancy for each service, periodic health checks for each service and database, and restart policiest to ensure that services continue running.
 
 `docker-compose up -d`
+
 `docker-compose ps`
 
 `docker kill wdm24-4-order-service-1-1`
+
 `docker start wdm24-4-order-service-1-1`
 
 `sleep 30`
+
 `docker-compose ps`
 
 `docker-compose logs -f`
