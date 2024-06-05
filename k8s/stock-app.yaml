@@ -16,6 +16,8 @@ kind: Deployment
 metadata:
   name: stock-deployment
 spec:
+  imagePullSecrets:
+    - name: my-dockerhub-secret
   replicas: 1
   selector:
     matchLabels:

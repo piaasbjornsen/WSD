@@ -25,6 +25,8 @@ spec:
       labels:
         component: user
     spec:
+      imagePullSecrets:
+        - name: my-dockerhub-secret
       containers:
         - name: user
           image: user:latest
