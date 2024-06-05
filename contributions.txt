@@ -4,6 +4,9 @@ Vincent
 - Worked on implementing fault tolerance with redundancy and health checks with Docker
 
 Pia
+- Worked on the architecture design section of phase 1 report
+- Worked on implementing SAGAs choreography and consistency, comparing to benchmarks.
+- Humor and jokes to lighten the mood 
 
 Gio
 - Worked on documenting section of phase 1
