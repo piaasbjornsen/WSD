@@ -6,5 +6,7 @@ Vincent
 Pia
 
 Gio
-
+- Worked on documenting section of phase 1
+- Worked on implmenenting atomicity
+- Worked on fixing Minikube implementation
 Ching
