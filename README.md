@@ -47,10 +47,10 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
 **_Requirements:_** You need to have access to kubectl of a k8s cluster.
 
 ### Phase 2 - Implement transactional protocol
-Implemented SAGAs choreography that ensures transactions check for the availablility of stock and funds before executing an order. When one of the services fails, changes in the database are rolled back and hte order is cancelled.
+Implemented SAGAs choreography that ensures transactions check for the availablility of stock and funds before executing an order. When one of the services fails, changes in the database are rolled back and the order is cancelled.
 
 ### Phase 3 - Testing fault tolerance
-With docker compose, implemented redundancy for each service, periodic health checks for each service and database, and restart policiest to ensure that services continue running.
+With docker compose, implemented redundancy for each service, periodic health checks for each service and database, and restart policies to ensure that services continue running.
 
 `docker-compose up -d`
 
