@@ -11,4 +11,6 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-EXPOSE 5000
+EXPOSE 8003
+
+CMD ["gunicorn", "-b", "0.0.0.0:8003", "app:app"]

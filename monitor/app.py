@@ -2,6 +2,7 @@ import os
 import threading
 import time
 import requests
+import logging
 from flask import Flask, jsonify, abort
 
 app = Flask("monitoring-service")
