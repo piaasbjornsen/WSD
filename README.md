@@ -55,3 +55,5 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
 
 `sleep 30`
 `docker-compose ps`
+
+`docker-compose logs -f`
