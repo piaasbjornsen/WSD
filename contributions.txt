@@ -1,0 +1,10 @@
+Vincent
+- Worked on the failure handling section of phase 1 report
+- Worked on implementing SAGAs choreography for phase 2
+- Worked on implementing fault tolerance with redundancy and health checks with Docker
+
+Pia
+
+Gio
+
+Ching
