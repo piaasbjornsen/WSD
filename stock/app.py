@@ -24,6 +24,11 @@ pubsub = db.pubsub()
 pubsub.subscribe("stock_events")
 
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify(status="healthy"), 200
+
+
 def publish_event(channel, event):
     for attempt in range(3):
         try:

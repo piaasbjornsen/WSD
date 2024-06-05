@@ -23,6 +23,11 @@ pubsub = db.pubsub()
 pubsub.subscribe("payment_events")
 
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify(status="healthy"), 200
+
+
 def publish_event(channel, event):
     for attempt in range(3):
         try:
@@ -182,6 +187,7 @@ def remove_credit(user_id: str, amount: int):
     return Response(
         f"User: {user_id} credit updated to: {user_entry.credit}", status=200
     )
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8001, debug=True)
