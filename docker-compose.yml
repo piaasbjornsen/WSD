@@ -147,3 +147,15 @@ services:
       retries: 3
       start_period: 40s
     restart: always
+
+  monitoring-service:
+    build: ./monitor
+    image: monitor:latest
+    command: gunicorn -b 0.0.0.0:8003 -w 1 --timeout 30 --log-level=info app:app
+    depends_on:
+      - order-service-1
+      - order-service-2
+      - stock-service-1
+      - stock-service-2
+      - payment-service-1
+      - payment-service-2
